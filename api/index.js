@@ -1,15 +1,12 @@
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-
 export const config = {
-  api: { bodyParser: false },
-  supportsResponseStreaming: true,
-  maxDuration: 60,
+  runtime: "edge",
 };
 
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+// Main upstream destination (trailing slash removed if present)
+const DESTINATION = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 
-const STRIP_HEADERS = new Set([
+// Headers that should never be forwarded upstream
+const BLOCKED_HEADERS = [
   "host",
   "connection",
   "keep-alive",
@@ -23,57 +20,93 @@ const STRIP_HEADERS = new Set([
   "x-forwarded-host",
   "x-forwarded-proto",
   "x-forwarded-port",
-]);
+];
 
-export default async function handler(req, res) {
-  if (!TARGET_BASE) {
-    res.statusCode = 500;
-    return res.end("Misconfigured: TARGET_DOMAIN is not set");
+// Quick check for ignored headers
+function shouldSkipHeader(name) {
+  return BLOCKED_HEADERS.includes(name) || name.startsWith("x-vercel-");
+}
+
+// Rebuild incoming request URL using the target base domain
+function buildTargetUrl(originalUrl) {
+  const slashIndex = originalUrl.indexOf("/", 8);
+
+  // No path found, fallback to root
+  if (slashIndex === -1) {
+    return DESTINATION + "/";
+  }
+
+  return DESTINATION + originalUrl.substring(slashIndex);
+}
+
+// Clone headers while keeping only safe / useful values
+function copyHeaders(sourceHeaders) {
+  const headers = new Headers();
+  let ipAddress = null;
+
+  for (const [key, value] of sourceHeaders.entries()) {
+    const lowerKey = key.toLowerCase();
+
+    if (shouldSkipHeader(lowerKey)) {
+      continue;
+    }
+
+    // Prefer real client IP if provided
+    if (lowerKey === "x-real-ip") {
+      ipAddress = value;
+      continue;
+    }
+
+    // Fallback if x-real-ip is missing
+    if (lowerKey === "x-forwarded-for") {
+      if (!ipAddress) {
+        ipAddress = value;
+      }
+      continue;
+    }
+
+    headers.set(key, value);
+  }
+
+  // Re-attach a single client IP value
+  if (ipAddress) {
+    headers.set("x-forwarded-for", ipAddress);
+  }
+
+  return headers;
+}
+
+export default async function handler(request) {
+  // Fail early if environment variable was not configured
+  if (!DESTINATION) {
+    return new Response("Misconfigured: TARGET_DOMAIN is not set", {
+      status: 500,
+    });
   }
 
   try {
-    const targetUrl = TARGET_BASE + req.url;
+    const finalUrl = buildTargetUrl(request.url);
+    const method = request.method;
+    const headers = copyHeaders(request.headers);
 
-    const headers = {};
-    let clientIp = null;
-    for (const key of Object.keys(req.headers)) {
-      const k = key.toLowerCase();
-      const v = req.headers[key];
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-vercel-")) continue;
-      if (k === "x-real-ip") { clientIp = v; continue; }
-      if (k === "x-forwarded-for") { if (!clientIp) clientIp = v; continue; }
-      headers[k] = Array.isArray(v) ? v.join(", ") : v;
-    }
-    if (clientIp) headers["x-forwarded-for"] = clientIp;
+    const options = {
+      method,
+      headers,
+      redirect: "manual", // pass redirects back to client untouched
+      duplex: "half", // needed for streamed request bodies
+    };
 
-    const method = req.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
-
-    const fetchOpts = { method, headers, redirect: "manual" };
-    if (hasBody) {
-      fetchOpts.body = Readable.toWeb(req);
-      fetchOpts.duplex = "half";
+    // Only attach body when request type supports it
+    if (method !== "GET" && method !== "HEAD") {
+      options.body = request.body;
     }
 
-    const upstream = await fetch(targetUrl, fetchOpts);
+    return await fetch(finalUrl, options);
+  } catch (error) {
+    console.error("relay error:", error);
 
-    res.statusCode = upstream.status;
-    for (const [k, v] of upstream.headers) {
-      if (k.toLowerCase() === "transfer-encoding") continue;
-      try { res.setHeader(k, v); } catch {}
-    }
-
-    if (upstream.body) {
-      await pipeline(Readable.fromWeb(upstream.body), res);
-    } else {
-      res.end();
-    }
-  } catch (err) {
-    console.error("relay error:", err);
-    if (!res.headersSent) {
-      res.statusCode = 502;
-      res.end("Bad Gateway: Tunnel Failed");
-    }
+    return new Response("Bad Gateway: Tunnel Failed", {
+      status: 502,
+    });
   }
 }
